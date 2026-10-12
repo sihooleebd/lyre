@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "timbre"
+version = "0.1.0"
+description = "SoundSource-style audio control panel for PipeWire"
+requires-python = ">=3.10"
+
+[project.scripts]
+timbre = "timbre.main:main"
+
+[tool.setuptools]
+packages = ["timbre"]
