@@ -215,7 +215,8 @@ class Events(threading.Thread):
         while not self._stop:
             try:
                 p = pulsectl.Pulse("timbre-events")
-                p.event_mask_set("sink", "sink_input", "server")
+                p.event_mask_set("sink", "source", "sink_input",
+                                 "source_output", "card", "server")
 
                 def _h(ev):
                     raise pulsectl.PulseLoopStop
@@ -456,6 +457,10 @@ class Timbre(Adw.Application):
             self.recover()
         return False
 
+    def _poll(self):
+        self.schedule_refresh()
+        return True
+
     def schedule_apply_outputs(self):
         if self._apply_src:
             GLib.source_remove(self._apply_src)
@@ -474,6 +479,11 @@ class Timbre(Adw.Application):
         return False
 
     def do_activate(self):
+        # Single instance: a second `timbre` invocation re-activates the primary -- just
+        # raise the existing window instead of building another one.
+        if getattr(self, "win", None) is not None:
+            self.win.present()
+            return
         self.pa = PA()
         self.pa.ensure_router()
         self.icon_theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
@@ -515,6 +525,10 @@ class Timbre(Adw.Application):
         self.refresh()
         self.events = Events(self.schedule_refresh)
         self.events.start()
+        # Guaranteed auto-refresh of the device list even if an event is missed (hotplug,
+        # default-device change, a device appearing/disappearing). Cheap: refresh reconciles
+        # rows and skips any slider the user is actively dragging, so no jank.
+        GLib.timeout_add_seconds(2, self._poll)
 
     def _launch(self, *cmd):
         try:

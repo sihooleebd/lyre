@@ -34,9 +34,12 @@ python3Packages.buildPythonApplication {
   # Routing shells out to `pactl` (pulseaudio) + `pw-link` (pipewire); bake both in
   # since neither is on the user's PATH. Hold off GApps auto-wrap so those tools +
   # the GI/typelib env all land on one wrapper.
+  # GSK_RENDERER=cairo: skip GTK4's GL/Vulkan context init at first window (a ~1s cold-start
+  # cost on Intel integrated graphics) -- this is a simple control panel, cairo renders it
+  # fine and Hyprland does the blur/opacity anyway. --set-default so it stays overridable.
   dontWrapGApps = true;
   preFixup = ''
-    makeWrapperArgs+=("''${gappsWrapperArgs[@]}" --prefix PATH : ${lib.makeBinPath [ pulseaudio pipewire ]})
+    makeWrapperArgs+=("''${gappsWrapperArgs[@]}" --prefix PATH : ${lib.makeBinPath [ pulseaudio pipewire ]} --set-default GSK_RENDERER cairo)
   '';
 
   doCheck = false;
