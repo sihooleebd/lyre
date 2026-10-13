@@ -37,6 +37,25 @@ BONFIRE = "bonfire"                 # the central null-sink (merge point)
 BANDS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]   # 10-band ISO graphic EQ
 NB = len(BANDS)
 Q = 1.41
+
+
+def _find_sofa():
+    """HRTF dataset for the spatializer: $BONFIRE_SOFA (set by the package wrapper), else a shipped
+    libmysofa one, else None (spatial just stays unavailable)."""
+    import glob
+    p = os.environ.get("BONFIRE_SOFA")
+    if p and os.path.exists(p):
+        return p
+    for pat in ("/run/current-system/sw/share/libmysofa/MIT_KEMAR_normal_pinna.sofa",
+                os.path.expanduser("~/.config/bonfire/hrtf.sofa"),
+                "/nix/store/*libmysofa*/share/libmysofa/MIT_KEMAR_normal_pinna.sofa"):
+        m = sorted(glob.glob(pat))
+        if m:
+            return m[0]
+    return None
+
+
+SOFA = _find_sofa()                 # per-app HRTF spatializer input (binaural, headphone-oriented)
 VIRTUAL = (BONFIRE, "easyeffects", "haku_combined")
 
 
@@ -82,6 +101,7 @@ def load_state():
     s.setdefault("out_eq", {})       # dev -> [NB gains]
     s.setdefault("app_eq", {})       # app -> [NB gains]
     s.setdefault("app_route", {})    # app -> device name to OVERRIDE to (absent/"" = follow system = the bonfire merge)
+    s.setdefault("spatial", False)   # global spatial mode: every app chain gets an HRTF spatializer, positioned live
     return s
 
 
@@ -95,8 +115,12 @@ def save_state(s):
 
 
 # ----------------------- filter-chain EQ -------------------------
-def eq_graph_args(node_name, gains):
-    """SPA-JSON module args: a stereo 10-band graphic EQ filter-chain sink."""
+def eq_graph_args(node_name, gains, spatial=False):
+    """SPA-JSON module args for a stereo 10-band graphic EQ filter-chain sink. When spatial=True (and a
+    SOFA is available), the EQ'd stereo is downmixed to mono and run through an HRTF spatializer whose
+    Azimuth/Elevation/Radius are driven live -- so the app becomes a binaural point source you can place
+    anywhere around the listener (used for the window-position effect; headphone-oriented)."""
+    use_spatial = bool(spatial and SOFA)
     nodes, links = [], []
     for ch in ("L", "R"):
         for i, f in enumerate(BANDS):
@@ -107,6 +131,18 @@ def eq_graph_args(node_name, gains):
             )
             if i > 0:
                 links.append(f'{{ output="eq{ch}_{i-1}:Out" input="eq{ch}_{i}:In" }}')
+    if use_spatial:
+        nodes.append('{ type=builtin name=mix label=mixer control={ "Gain 1"=0.5 "Gain 2"=0.5 } }')  # L+R -> mono, -6 dB
+        nodes.append(
+            f'{{ type=sofa name=spat label=spatializer config={{ filename="{SOFA}" }} '
+            'control={ "Azimuth"=0.0 "Elevation"=0.0 "Radius"=1.0 } }'
+        )
+        links.append(f'{{ output="eqL_{NB-1}:Out" input="mix:In 1" }}')
+        links.append(f'{{ output="eqR_{NB-1}:Out" input="mix:In 2" }}')
+        links.append('{ output="mix:Out" input="spat:In" }')
+        outputs = '[ "spat:Out L" "spat:Out R" ]'
+    else:
+        outputs = f'[ "eqL_{NB-1}:Out" "eqR_{NB-1}:Out" ]'
     return (
         "{ "
         f'node.description="bonfire eq {node_name}" '
@@ -114,7 +150,7 @@ def eq_graph_args(node_name, gains):
         f'nodes=[ {" ".join(nodes)} ] '
         f'links=[ {" ".join(links)} ] '
         f'inputs=[ "eqL_0:In" "eqR_0:In" ] '
-        f'outputs=[ "eqL_{NB-1}:Out" "eqR_{NB-1}:Out" ] '
+        f'outputs={outputs} '
         "} "
         f'capture.props={{ node.name="{node_name}" media.class=Audio/Sink '
         "node.autoconnect=false audio.channels=2 audio.position=[FL FR] } "
@@ -142,16 +178,18 @@ def node_id(node_name):
 class EqChain:
     """A hosted 10-band EQ filter-chain. Audio in at <name>:playback_*, out at <name>.out:output_*."""
 
-    def __init__(self, node_name, gains=None):
+    def __init__(self, node_name, gains=None, spatial=False):
         self.node_name = node_name
         self.gains = (list(gains) + [0.0] * NB)[:NB] if gains else [0.0] * NB
+        self.spatial = bool(spatial)              # chain carries an HRTF spatializer stage
+        self.pos = (0.0, 0.0, 1.0)                # az, el, rad (only meaningful when spatial)
         self.proc = None
         self._nid = None                          # cached node id (avoid re-parsing `pw-cli ls Node`)
 
     def start(self):
         if self.alive():
             return
-        args = eq_graph_args(self.node_name, self.gains)
+        args = eq_graph_args(self.node_name, self.gains, spatial=self.spatial)
         self.proc = subprocess.Popen(
             ["pw-cli", "-m", "load-module", "libpipewire-module-filter-chain", args],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
@@ -160,6 +198,18 @@ class EqChain:
             if self._nid is not None:
                 break
             time.sleep(0.05)
+        if self.spatial:                          # re-assert any position captured before (re)start
+            self.set_pos(*self.pos)
+
+    def set_pos(self, az, el, rad):
+        self.pos = (az, el, rad)
+        if not self.spatial:
+            return
+        nid = self.nid()
+        if nid is None:
+            return
+        sh("pw-cli", "set-param", str(nid), "Props",
+           f'{{ params=[ "Azimuth" {az} "Elevation" {el} "Radius" {rad} ] }}')
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
@@ -209,6 +259,7 @@ class Engine:
         self.app_chains = {}       # appkey -> EqChain  (app -> eq -> target)
         self._app_link = {}        # appkey -> last eqapp.out target (skip re-linking a steady route)
         self._active_outs = set()  # devices currently wired into the fan-out (for delta applies)
+        self.spatial_enabled = bool(self.state.get("spatial"))  # global spatializer mode
         self.cmd_q = queue.Queue() # (parts, reply_queue) from the socket thread -> the worker thread
         self.lock = threading.RLock()
 
@@ -357,10 +408,11 @@ class Engine:
     def ensure_app_eq(self, key):
         name = "eqapp_" + sanitize(key)
         chain = self.app_chains.get(key)
-        if chain is None or not chain.alive():
+        want_spatial = self.spatial_enabled
+        if chain is None or not chain.alive() or chain.spatial != want_spatial:
             if chain:
                 chain.stop()
-            chain = EqChain(name, self.state["app_eq"].get(key))
+            chain = EqChain(name, self.state["app_eq"].get(key), spatial=want_spatial)
             chain.start()
             self.app_chains[key] = chain
             self._app_link.pop(key, None)             # new chain has no out links yet -> force a (re)link
@@ -410,8 +462,11 @@ class Engine:
         for si in self._app_streams():
             key = clean_app_name(si)
             gains = self.state["app_eq"].get(key)
+            has_eq = gains and not flat(gains)
+            # a chain is needed for EQ OR for spatial mode (the spatializer lives in the chain)
+            needs_chain = self.spatial_enabled or has_eq
             target = self._route_target(key, have)        # bonfire sink name, or an override device
-            if gains and not flat(gains):
+            if needs_chain:
                 active.add(key)
                 chain = self.ensure_app_eq(key)
                 if self._app_link.get(key) != target:    # only (re)link when the route actually changed
@@ -472,6 +527,60 @@ class Engine:
             save_state(self.state)
             self.reconcile_apps()
 
+    # ---- spatial mode: an HRTF spatializer in every app chain, positioned live (bonfire is the API;
+    #      a separate watcher maps window geometry -> pos). Headphone-oriented. ----
+    def set_spatial(self, on):
+        with self.lock:
+            on = bool(on)
+            if on and not SOFA:
+                return                              # no HRTF data -> stay off
+            self.spatial_enabled = on
+            self.state["spatial"] = on
+            save_state(self.state)
+            self.reconcile_apps()                   # rebuilds app chains with/without the spatializer
+
+    def _is_descendant(self, pid, ancestor):
+        """True if `ancestor` is pid itself or one of its forebears (walk /proc ppid up from pid)."""
+        p, seen = pid, 0
+        while p and p > 1 and seen < 40:
+            if p == ancestor:
+                return True
+            try:
+                with open(f"/proc/{p}/stat") as f:
+                    p = int(f.read().rsplit(")", 1)[1].split()[1])   # ppid = field 4 (after "comm)")
+            except Exception:
+                return False
+            seen += 1
+        return p == ancestor
+
+    def _resolve_app(self, target):
+        """A pos target is either an app key, or 'pid:<n>' (a window pid) -> the app key of the stream
+        whose process is that pid or a descendant of it."""
+        if not target.startswith("pid:"):
+            return target
+        try:
+            pid = int(target[4:])
+        except ValueError:
+            return None
+        streams = self._app_streams()
+        for si in streams:                          # exact pid first
+            if str(si.proplist.get("application.process.id") or "") == str(pid):
+                return clean_app_name(si)
+        for si in streams:                          # else a stream whose process descends from the window pid
+            spid = si.proplist.get("application.process.id")
+            if spid and self._is_descendant(int(spid), pid):
+                return clean_app_name(si)
+        return None
+
+    def set_pos(self, target, az, el, rad):
+        with self.lock:
+            key = self._resolve_app(target)
+            if not key:
+                return
+            chain = self.app_chains.get(key)
+            if chain and chain.spatial:
+                chain.set_pos(az, el, rad)
+
     def status(self):
         try:
             default = self.pa.server_info().default_sink_name
@@ -487,6 +596,8 @@ class Engine:
             "apps": sorted(set(clean_app_name(si) for si in self._app_streams())),
             "app_eq": self.state["app_eq"],
             "app_route": self.state["app_route"],
+            "spatial": self.spatial_enabled,
+            "spatial_available": bool(SOFA),
         }
 
     def reconcile(self):
@@ -593,6 +704,12 @@ class Engine:
             if cmd == "route" and len(parts) >= 3:        # route <app> <device>|system (per-app output override)
                 dev = parts[2]
                 self.set_app_route(parts[1], "" if dev in ("system", "") else dev)
+                return "ok"
+            if cmd == "spatial" and len(parts) >= 2:      # spatial on|off  (global HRTF mode)
+                self.set_spatial(parts[1] in ("on", "1", "true"))
+                return "ok"
+            if cmd == "pos" and len(parts) >= 5:          # pos <app|pid:N> <azimuth> <elevation> <radius>
+                self.set_pos(parts[1], float(parts[2]), float(parts[3]), float(parts[4]))
                 return "ok"
             if cmd == "eq" and len(parts) >= 3 and parts[1] in ("out", "app"):
                 scope, target = parts[1], parts[2]
