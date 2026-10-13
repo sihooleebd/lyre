@@ -2,7 +2,6 @@
 , python3Packages
 , pulseaudio
 , pipewire
-, libmysofa
 }:
 
 python3Packages.buildPythonApplication {
@@ -18,12 +17,7 @@ python3Packages.buildPythonApplication {
   # The engine shells out to: pactl (null-sink / move-sink-input / default-sink),
   # pw-cli (hosting the filter-chain EQ modules + live band params), and pw-link
   # (wiring the graph). Bake them in -- none are on the user-service PATH.
-  # BONFIRE_SOFA = the HRTF dataset the per-app spatializer loads (libmysofa ships
-  # MIT KEMAR); pinned here so spatial mode doesn't depend on a store-path glob.
-  makeWrapperArgs = [
-    "--prefix" "PATH" ":" (lib.makeBinPath [ pulseaudio pipewire ])
-    "--set-default" "BONFIRE_SOFA" "${libmysofa}/share/libmysofa/MIT_KEMAR_normal_pinna.sofa"
-  ];
+  makeWrapperArgs = [ "--prefix" "PATH" ":" (lib.makeBinPath [ pulseaudio pipewire ]) ];
 
   doCheck = false;
   pythonImportsCheck = [ "bonfire" ];
