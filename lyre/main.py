@@ -37,7 +37,25 @@ LYRE = "lyre"                 # the central null-sink (merge point)
 BANDS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]   # 10-band ISO graphic EQ
 NB = len(BANDS)
 Q = 1.41
-VIRTUAL = (LYRE, "easyeffects", "haku_combined")
+VIRTUAL = (LYRE, "easyeffects", "bonfire_combined")
+
+# Braille mark shown by the human `lyre status` screen (`lyre report` stays the JSON the
+# flare panel parses). Kept in sync with ../logo.txt via .logo-gen.py.
+LYRE_LOGO = """
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⢀⣤⣶⣦⡤⠤⠤⠤⠤⠤⠤⠤⠤⠤⣤⣶⣦⣄⠀⠀
+⠀⠀⢸⣿⣿⣿⢻⠉⡏⢹⠉⡏⢹⠉⡏⢹⢻⣿⣿⣿⠀⠀
+⠀⠀⠀⣽⡟⠁⢸⠀⡇⢸⠀⡇⢸⠀⡇⢸⠀⠙⣿⡅⠀⠀
+⠀⠀⠀⣿⡇⠀⢸⠀⡇⢸⠀⡇⢸⠀⡇⢸⠀⠀⣿⡇⠀⠀
+⠀⠀⠀⣿⡇⠀⢸⠀⡇⢸⠀⡇⢸⠀⡇⢸⠀⠀⣿⡇⠀⠀
+⠀⠀⠀⢹⣷⡀⢸⠀⡇⢸⠀⡇⢸⠀⡇⢸⠀⣰⣿⠁⠀⠀
+⠀⠀⠀⠀⢻⣷⣸⠀⡇⢸⠀⡇⢸⠀⡇⢸⣰⣿⠃⠀⠀⠀
+⠀⠀⠀⠀⠀⠻⣿⣄⣇⣸⣤⣧⣼⣀⣇⣼⡿⠃⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⢈⡿⠋⠉⠉⡉⠉⠉⠻⣏⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠘⣧⡀⠀⠈⠋⠀⠀⣠⡟⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠈⠙⡟⠶⠶⠞⡟⠉⠀⠀⠀⠀⠀⠀⠀
+"""
+
 
 
 def sh(*a):
@@ -583,7 +601,7 @@ class Engine:
             return "err empty"
         cmd = parts[0]
         try:
-            if cmd == "status":
+            if cmd in ("report", "status"):   # JSON; `lyre status` (human) asks for this under the hood
                 return json.dumps(self.status())
             if cmd == "ping":
                 return "pong"
@@ -638,13 +656,49 @@ def run_daemon():
             conn.close()
 
 
+def render_status(st):
+    """The human `lyre status` screen: the braille mark beside a readable summary."""
+    logo = LYRE_LOGO.strip("\n").split("\n")
+    gold = [220, 220, 214, 214, 208, 208, 208, 214, 214, 220, 220, 223]
+    R, DIM, B = "\033[0m", "\033[2m", "\033[1m"
+    devs = {d["name"]: d["description"] for d in st.get("devices", [])}
+    default = st.get("default", "")
+    outs = st.get("outputs") or []
+    apps = st.get("apps") or []
+    nroute = len([a for a, v in (st.get("app_route") or {}).items() if v])
+    out_desc = ", ".join(devs.get(o, o) for o in outs) if outs else "follow default"
+    info = [
+        f"{B}\033[38;5;214mlyre{R}",
+        f"{DIM}per-app · per-output EQ + routing{R}",
+        "",
+        f"{DIM}engine {R}  " + (f"\033[32m● running{R}" if st.get("lyre") else f"\033[90m○ stopped{R}"),
+        f"{DIM}default{R}  {devs.get(default, default) or '—'}",
+        f"{DIM}outputs{R}  {out_desc}",
+        f"{DIM}apps   {R}  " + (", ".join(apps) if apps else "—"),
+        f"{DIM}routes {R}  {nroute} app override(s)",
+    ]
+    lines = []
+    for i, lg in enumerate(logo):
+        right = info[i - 2] if 0 <= i - 2 < len(info) else ""
+        lines.append(f"\033[38;5;{gold[i % len(gold)]}m{lg}{R}  {right}")
+    return "\n".join(lines)
+
+
 def run_cli(args):
     try:
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         c.connect(SOCK)
-        c.sendall(json.dumps(args).encode())
-        print(c.recv(1 << 20).decode("utf-8", "replace").rstrip())
+        human = args[:1] == ["status"]                 # `lyre status` -> human screen; `lyre report` -> JSON
+        c.sendall(json.dumps(["report"] if human else args).encode())
+        reply = c.recv(1 << 20).decode("utf-8", "replace").rstrip()
         c.close()
+        if human:
+            try:
+                print(render_status(json.loads(reply)))
+                return 0
+            except Exception:
+                pass                                    # fall back to raw if the daemon reply isn't the expected JSON
+        print(reply)
         return 0
     except (FileNotFoundError, ConnectionRefusedError):
         sys.stderr.write("lyre: daemon not running\n")
