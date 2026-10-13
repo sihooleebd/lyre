@@ -3,13 +3,13 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "bonfire"
+name = "lyre"
 version = "0.1.0"
 description = "Headless per-app / per-output EQ + routing engine for PipeWire"
 requires-python = ">=3.10"
 
 [project.scripts]
-bonfire = "bonfire.main:main"
+lyre = "lyre.main:main"
 
 [tool.setuptools]
-packages = ["bonfire"]
+packages = ["lyre"]

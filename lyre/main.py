@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""bonfire -- a headless, CLI-driven audio engine for PipeWire.
+"""lyre -- a headless, CLI-driven audio engine for PipeWire.
 
 Replaces EasyEffects with one native graph:
 
-    apps ─▶ [per-app EQ]* ─▶ 🔥 bonfire (null sink) ─▶ [per-output EQ] ─▶ device(s)
+    apps ─▶ [per-app EQ]* ─▶ 🔥 lyre (null sink) ─▶ [per-output EQ] ─▶ device(s)
 
 Every EQ is a native `module-filter-chain` (builtin biquad bands) hosted by this
 daemon (a filter-chain only lives as long as the client that loaded it, so the
@@ -29,15 +29,15 @@ except ImportError:
 
 HOME = os.path.expanduser("~")
 XDG = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-CFG = os.path.join(os.environ.get("XDG_CONFIG_HOME", f"{HOME}/.config"), "bonfire")
+CFG = os.path.join(os.environ.get("XDG_CONFIG_HOME", f"{HOME}/.config"), "lyre")
 STATE = os.path.join(CFG, "state.json")
-SOCK = os.path.join(XDG, "bonfire.sock")
+SOCK = os.path.join(XDG, "lyre.sock")
 
-BONFIRE = "bonfire"                 # the central null-sink (merge point)
+LYRE = "lyre"                 # the central null-sink (merge point)
 BANDS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]   # 10-band ISO graphic EQ
 NB = len(BANDS)
 Q = 1.41
-VIRTUAL = (BONFIRE, "easyeffects", "haku_combined")
+VIRTUAL = (LYRE, "easyeffects", "haku_combined")
 
 
 def sh(*a):
@@ -81,7 +81,7 @@ def load_state():
     s.setdefault("outputs", [])      # active output device names
     s.setdefault("out_eq", {})       # dev -> [NB gains]
     s.setdefault("app_eq", {})       # app -> [NB gains]
-    s.setdefault("app_route", {})    # app -> device name to OVERRIDE to (absent/"" = follow system = the bonfire merge)
+    s.setdefault("app_route", {})    # app -> device name to OVERRIDE to (absent/"" = follow system = the lyre merge)
     return s
 
 
@@ -109,7 +109,7 @@ def eq_graph_args(node_name, gains):
                 links.append(f'{{ output="eq{ch}_{i-1}:Out" input="eq{ch}_{i}:In" }}')
     return (
         "{ "
-        f'node.description="bonfire eq {node_name}" '
+        f'node.description="lyre eq {node_name}" '
         "filter.graph={ "
         f'nodes=[ {" ".join(nodes)} ] '
         f'links=[ {" ".join(links)} ] '
@@ -119,8 +119,8 @@ def eq_graph_args(node_name, gains):
         f'capture.props={{ node.name="{node_name}" media.class=Audio/Sink '
         "node.autoconnect=false audio.channels=2 audio.position=[FL FR] } "
         # node.autoconnect=false is CRITICAL: without it WirePlumber auto-links this chain's output
-        # back into the bonfire sink (it's the default), making bonfire->monitor->eq->bonfire a
-        # feedback loop that kills playback. bonfire links every edge explicitly, so no autoconnect.
+        # back into the lyre sink (it's the default), making lyre->monitor->eq->lyre a
+        # feedback loop that kills playback. lyre links every edge explicitly, so no autoconnect.
         f'playback.props={{ node.name="{node_name}.out" node.passive=true node.autoconnect=false '
         "audio.channels=2 audio.position=[FL FR] } "
         "}"
@@ -205,7 +205,7 @@ class Engine:
         self.pa = None
         self._ev = None
         self.state = load_state()
-        self.out_chains = {}       # dev -> EqChain  (bonfire.monitor -> eq -> device)
+        self.out_chains = {}       # dev -> EqChain  (lyre.monitor -> eq -> device)
         self.app_chains = {}       # appkey -> EqChain  (app -> eq -> target)
         self._app_link = {}        # appkey -> last eqapp.out target (skip re-linking a steady route)
         self._active_outs = set()  # devices currently wired into the fan-out (for delta applies)
@@ -213,8 +213,8 @@ class Engine:
         self.lock = threading.RLock()
 
     def _open(self):
-        self.pa = pulsectl.Pulse("bonfire")
-        self._ev = pulsectl.Pulse("bonfire-events")
+        self.pa = pulsectl.Pulse("lyre")
+        self._ev = pulsectl.Pulse("lyre-events")
         self._ev.event_mask_set("sink", "source", "sink_input", "card", "server")
         self._ev.event_callback_set(lambda ev: (_ for _ in ()).throw(pulsectl.PulseLoopStop))
 
@@ -230,12 +230,12 @@ class Engine:
     def real_sinks(self):
         return [s for s in self.sinks() if is_real(s.name)]
 
-    def ensure_bonfire(self):
-        if not any(s.name == BONFIRE for s in self.sinks()):
+    def ensure_lyre(self):
+        if not any(s.name == LYRE for s in self.sinks()):
             sh("pactl", "load-module", "module-null-sink", "media.class=Audio/Sink",
-               f"sink_name={BONFIRE}", "channel_map=front-left,front-right")
+               f"sink_name={LYRE}", "channel_map=front-left,front-right")
             for _ in range(30):
-                if any(s.name == BONFIRE for s in self.sinks()):
+                if any(s.name == LYRE for s in self.sinks()):
                     break
                 time.sleep(0.1)
 
@@ -247,7 +247,7 @@ class Engine:
                 cur = line.strip()
             else:
                 s = line.strip()
-                if cur and cur.startswith(BONFIRE + ":monitor") and s.startswith("|->"):
+                if cur and cur.startswith(LYRE + ":monitor") and s.startswith("|->"):
                     links.append((cur, s[3:].strip()))
         return links
 
@@ -272,15 +272,15 @@ class Engine:
         if not chain:
             return
         for ch in ("FL", "FR"):
-            sh("pw-link", "-d", f"{BONFIRE}:monitor_{ch}", f"{chain.node_name}:playback_{ch}")
+            sh("pw-link", "-d", f"{LYRE}:monitor_{ch}", f"{chain.node_name}:playback_{ch}")
             sh("pw-link", "-d", f"{chain.node_name}.out:output_{ch}", f"{dev}:playback_{ch}")
 
     def _apply(self, names, full=False):
-        """bonfire.monitor -> [per-output EQ] -> each device. DELTA by default: only touch devices
+        """lyre.monitor -> [per-output EQ] -> each device. DELTA by default: only touch devices
         that actually changed, so toggling one output is fast and doesn't glitch the others (the old
         clear-everything-and-rebuild was the ~6s toggle + the re-poll of every EQ chain). full=True
         clears and rebuilds the whole fan-out (daemon start / device hotplug). Caller holds self.lock."""
-        self.ensure_bonfire()
+        self.ensure_lyre()
         have = {s.name for s in self.real_sinks()}
         names = [n for n in names if n in have]
         if not names:
@@ -303,11 +303,11 @@ class Engine:
             sh("pactl", "suspend-sink", dev, "0")         # wake (idle sinks get dropped otherwise)
             chain = self.ensure_out_eq(dev)
             for ch in ("FL", "FR"):
-                sh("pw-link", f"{BONFIRE}:monitor_{ch}", f"{chain.node_name}:playback_{ch}")
+                sh("pw-link", f"{LYRE}:monitor_{ch}", f"{chain.node_name}:playback_{ch}")
                 sh("pw-link", f"{chain.node_name}.out:output_{ch}", f"{dev}:playback_{ch}")
-        if os.environ.get("BONFIRE_NO_DEFAULT") != "1":   # test guard: don't hijack the live default
-            sh("pactl", "set-default-sink", BONFIRE)
-        sh("pactl", "set-sink-mute", BONFIRE, "0")
+        if os.environ.get("LYRE_NO_DEFAULT") != "1":   # test guard: don't hijack the live default
+            sh("pactl", "set-default-sink", LYRE)
+        sh("pactl", "set-sink-mute", LYRE, "0")
         self._active_outs = want
         self.state["outputs"] = names
         save_state(self.state)
@@ -344,7 +344,7 @@ class Engine:
                 chain.apply_all()
             save_state(self.state)
 
-    # ---- per-app EQ: each EQ'd app -> its own chain -> bonfire; flat apps go direct ----
+    # ---- per-app EQ: each EQ'd app -> its own chain -> lyre; flat apps go direct ----
     def _app_streams(self):
         out = []
         for si in self.pa.sink_input_list():
@@ -393,24 +393,24 @@ class Engine:
                 sh("pw-link", f"{node}:output_{ch}", want)
 
     def _route_target(self, key, have):
-        """Where an app should land: an override device (if set + present), else the bonfire merge."""
+        """Where an app should land: an override device (if set + present), else the lyre merge."""
         dev = self.state["app_route"].get(key, "")
-        return dev if (dev and dev in have) else BONFIRE
+        return dev if (dev and dev in have) else LYRE
 
     def reconcile_apps(self):
-        """Send each app to its route target -- an override device, else the bonfire merge. Apps with a
+        """Send each app to its route target -- an override device, else the lyre merge. Apps with a
         non-flat EQ pass through their own eqapp chain first (chain.out -> target); flat apps move
         straight to the target."""
         by_name = {s.name: s for s in self.sinks()}
-        if BONFIRE not in by_name:
+        if LYRE not in by_name:
             return
         have = {s.name for s in self.real_sinks()}
-        no_move = os.environ.get("BONFIRE_NO_MOVE") == "1"
+        no_move = os.environ.get("LYRE_NO_MOVE") == "1"
         active = set()
         for si in self._app_streams():
             key = clean_app_name(si)
             gains = self.state["app_eq"].get(key)
-            target = self._route_target(key, have)        # bonfire sink name, or an override device
+            target = self._route_target(key, have)        # lyre sink name, or an override device
             if gains and not flat(gains):
                 active.add(key)
                 chain = self.ensure_app_eq(key)
@@ -463,7 +463,7 @@ class Engine:
             self.reconcile_apps()
 
     def set_app_route(self, app, dev):
-        """Pin an app's output: dev="" (or "system") = follow the bonfire merge; else override to dev."""
+        """Pin an app's output: dev="" (or "system") = follow the lyre merge; else override to dev."""
         with self.lock:
             if dev:
                 self.state["app_route"][app] = dev
@@ -478,7 +478,7 @@ class Engine:
         except Exception:
             default = ""
         return {
-            "bonfire": any(s.name == BONFIRE for s in self.sinks()),
+            "lyre": any(s.name == LYRE for s in self.sinks()),
             "default": default,
             "outputs": self.state["outputs"],
             "devices": [{"name": s.name, "description": s.description} for s in self.real_sinks()],
@@ -491,12 +491,12 @@ class Engine:
 
     def reconcile(self):
         """Re-apply ONLY when the graph actually needs it (device set changed, a chain died,
-        or the bonfire sink vanished) -- reading state inside the lock so we never re-apply a
+        or the lyre sink vanished) -- reading state inside the lock so we never re-apply a
         stale outputs list, and never churn links on every event (which would glitch audio)."""
         with self.lock:
             try:
                 devs = frozenset(s.name for s in self.real_sinks())
-                ok = (any(s.name == BONFIRE for s in self.sinks())
+                ok = (any(s.name == LYRE for s in self.sinks())
                       and self.out_chains
                       and all(c.alive() for c in self.out_chains.values()))
                 if ok and devs == getattr(self, "_last_devs", None):
@@ -508,7 +508,7 @@ class Engine:
 
     def cleanup_orphans(self):
         """Kill eqout_/eqapp_ filter-chain hosts left by a previous daemon instance (they survive as
-        detached processes) and unload stale bonfire null-sinks, so chains don't pile up across
+        detached processes) and unload stale lyre null-sinks, so chains don't pile up across
         restarts (the pile-up tangles the graph: several nodes share a name, links hit the wrong one).
         Safe at startup -- this daemon has no children yet, so every such host is an orphan."""
         try:
@@ -526,14 +526,14 @@ class Engine:
         except Exception:
             pass
         for line in sh("pactl", "list", "short", "modules").stdout.splitlines():
-            if "module-null-sink" in line and f"sink_name={BONFIRE}" in line:
+            if "module-null-sink" in line and f"sink_name={LYRE}" in line:
                 mid = line.split()[0] if line.split() else ""
                 if mid:
                     sh("pactl", "unload-module", mid)
 
     def start(self):
         self.cleanup_orphans()
-        self.ensure_bonfire()
+        self.ensure_lyre()
         want = self.state["outputs"]
         if not want:
             first = next((s.name for s in self.real_sinks()), None)
@@ -647,7 +647,7 @@ def run_cli(args):
         c.close()
         return 0
     except (FileNotFoundError, ConnectionRefusedError):
-        sys.stderr.write("bonfire: daemon not running\n")
+        sys.stderr.write("lyre: daemon not running\n")
         return 1
 
 

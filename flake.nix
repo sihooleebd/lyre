@@ -1,5 +1,5 @@
 {
-  description = "bonfire -- headless per-app / per-output EQ + routing engine for PipeWire";
+  description = "lyre -- headless per-app / per-output EQ + routing engine for PipeWire";
 
   # Pinned to plain nixos-unstable (same track as the host's nixpkgs-upstream) so the
   # whole closure substitutes from cache.nixos.org -- the consuming system flake adds
@@ -13,17 +13,17 @@
     in
     {
       packages = forAllSystems (pkgs: rec {
-        bonfire = pkgs.callPackage ./package.nix { };
-        default = bonfire;
+        lyre = pkgs.callPackage ./package.nix { };
+        default = lyre;
       });
 
       apps = forAllSystems (pkgs: rec {
-        bonfire = {
+        lyre = {
           type = "app";
-          program = "${self.packages.${pkgs.system}.bonfire}/bin/bonfire";
+          program = "${self.packages.${pkgs.system}.lyre}/bin/lyre";
           meta.description = "Headless PipeWire EQ + routing engine";
         };
-        default = bonfire;
+        default = lyre;
       });
 
       devShells = forAllSystems (pkgs: {
@@ -33,7 +33,7 @@
             pkgs.pulseaudio
             pkgs.pipewire
           ];
-          shellHook = ''echo "bonfire dev shell -- run: python -m bonfire.main daemon"'';
+          shellHook = ''echo "lyre dev shell -- run: python -m lyre.main daemon"'';
         };
       });
     };

@@ -5,7 +5,7 @@
 }:
 
 python3Packages.buildPythonApplication {
-  pname = "bonfire";
+  pname = "lyre";
   version = "0.1.0";
   pyproject = true;
   src = ./.;
@@ -20,13 +20,13 @@ python3Packages.buildPythonApplication {
   makeWrapperArgs = [ "--prefix" "PATH" ":" (lib.makeBinPath [ pulseaudio pipewire ]) ];
 
   doCheck = false;
-  pythonImportsCheck = [ "bonfire" ];
+  pythonImportsCheck = [ "lyre" ];
 
   meta = {
     description = "Headless per-app / per-output EQ + routing engine for PipeWire (replaces EasyEffects)";
-    homepage = "https://github.com/sihooleebd/bonfire";
+    homepage = "https://github.com/sihooleebd/lyre";
     license = lib.licenses.mit;
-    mainProgram = "bonfire";
+    mainProgram = "lyre";
     platforms = lib.platforms.linux;
   };
 }
