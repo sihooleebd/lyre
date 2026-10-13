@@ -17,6 +17,7 @@ import sys
 import json
 import time
 import queue
+import signal
 import socket
 import threading
 import subprocess
@@ -116,8 +117,11 @@ def eq_graph_args(node_name, gains):
         f'outputs=[ "eqL_{NB-1}:Out" "eqR_{NB-1}:Out" ] '
         "} "
         f'capture.props={{ node.name="{node_name}" media.class=Audio/Sink '
-        "audio.channels=2 audio.position=[FL FR] } "
-        f'playback.props={{ node.name="{node_name}.out" node.passive=true '
+        "node.autoconnect=false audio.channels=2 audio.position=[FL FR] } "
+        # node.autoconnect=false is CRITICAL: without it WirePlumber auto-links this chain's output
+        # back into the bonfire sink (it's the default), making bonfire->monitor->eq->bonfire a
+        # feedback loop that kills playback. bonfire links every edge explicitly, so no autoconnect.
+        f'playback.props={{ node.name="{node_name}.out" node.passive=true node.autoconnect=false '
         "audio.channels=2 audio.position=[FL FR] } "
         "}"
     )
@@ -502,7 +506,33 @@ class Engine:
             except Exception:
                 self.reconnect()
 
+    def cleanup_orphans(self):
+        """Kill eqout_/eqapp_ filter-chain hosts left by a previous daemon instance (they survive as
+        detached processes) and unload stale bonfire null-sinks, so chains don't pile up across
+        restarts (the pile-up tangles the graph: several nodes share a name, links hit the wrong one).
+        Safe at startup -- this daemon has no children yet, so every such host is an orphan."""
+        try:
+            for pid in os.listdir("/proc"):
+                if not pid.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{pid}/cmdline", "rb") as f:
+                        cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+                except Exception:
+                    continue
+                if "pw-cli" in cmd and "module-filter-chain" in cmd and ("eqout_" in cmd or "eqapp_" in cmd):
+                    try: os.kill(int(pid), signal.SIGKILL)
+                    except Exception: pass
+        except Exception:
+            pass
+        for line in sh("pactl", "list", "short", "modules").stdout.splitlines():
+            if "module-null-sink" in line and f"sink_name={BONFIRE}" in line:
+                mid = line.split()[0] if line.split() else ""
+                if mid:
+                    sh("pactl", "unload-module", mid)
+
     def start(self):
+        self.cleanup_orphans()
         self.ensure_bonfire()
         want = self.state["outputs"]
         if not want:
