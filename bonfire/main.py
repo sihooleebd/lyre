@@ -16,6 +16,7 @@ import re
 import sys
 import json
 import time
+import queue
 import socket
 import threading
 import subprocess
@@ -78,7 +79,8 @@ def load_state():
         s = {}
     s.setdefault("outputs", [])      # active output device names
     s.setdefault("out_eq", {})       # dev -> [NB gains]
-    s.setdefault("app_eq", {})       # app -> [NB gains]  (phase 2)
+    s.setdefault("app_eq", {})       # app -> [NB gains]
+    s.setdefault("app_route", {})    # app -> device name to OVERRIDE to (absent/"" = follow system = the bonfire merge)
     return s
 
 
@@ -133,10 +135,6 @@ def node_id(node_name):
     return None
 
 
-def node_exists(node_name):
-    return node_id(node_name) is not None
-
-
 class EqChain:
     """A hosted 10-band EQ filter-chain. Audio in at <name>:playback_*, out at <name>.out:output_*."""
 
@@ -144,6 +142,7 @@ class EqChain:
         self.node_name = node_name
         self.gains = (list(gains) + [0.0] * NB)[:NB] if gains else [0.0] * NB
         self.proc = None
+        self._nid = None                          # cached node id (avoid re-parsing `pw-cli ls Node`)
 
     def start(self):
         if self.alive():
@@ -152,13 +151,19 @@ class EqChain:
         self.proc = subprocess.Popen(
             ["pw-cli", "-m", "load-module", "libpipewire-module-filter-chain", args],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        for _ in range(40):                       # wait until the node is up
-            if node_exists(self.node_name):
+        for _ in range(60):                       # wait until the node is up (then cache its id)
+            self._nid = node_id(self.node_name)
+            if self._nid is not None:
                 break
             time.sleep(0.05)
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
+
+    def nid(self):
+        if self._nid is None:
+            self._nid = node_id(self.node_name)
+        return self._nid
 
     def stop(self):
         if self.proc:
@@ -167,19 +172,20 @@ class EqChain:
             except Exception:
                 pass
         self.proc = None
+        self._nid = None
 
     def set_band(self, i, gain):
         if not (0 <= i < NB):
             return
         self.gains[i] = gain
-        nid = node_id(self.node_name)
+        nid = self.nid()
         if nid is None:
             return
         sh("pw-cli", "set-param", str(nid), "Props",
            f'{{ params=[ "eqL_{i}:Gain" {gain} "eqR_{i}:Gain" {gain} ] }}')
 
     def apply_all(self):
-        nid = node_id(self.node_name)
+        nid = self.nid()
         if nid is None:
             return
         params = " ".join(f'"eqL_{i}:Gain" {g} "eqR_{i}:Gain" {g}'
@@ -190,18 +196,29 @@ class EqChain:
 # ----------------------------- engine ----------------------------
 class Engine:
     def __init__(self):
-        self.pa = pulsectl.Pulse("bonfire")
+        # pulse connections are created in worker() -- libpulse's mainloop can only be driven from the
+        # thread that created it, so ALL pulse access lives on the worker thread (see worker/submit).
+        self.pa = None
+        self._ev = None
         self.state = load_state()
         self.out_chains = {}       # dev -> EqChain  (bonfire.monitor -> eq -> device)
-        self.app_chains = {}       # appkey -> EqChain  (app -> eq -> bonfire)
+        self.app_chains = {}       # appkey -> EqChain  (app -> eq -> target)
+        self._app_link = {}        # appkey -> last eqapp.out target (skip re-linking a steady route)
+        self._active_outs = set()  # devices currently wired into the fan-out (for delta applies)
+        self.cmd_q = queue.Queue() # (parts, reply_queue) from the socket thread -> the worker thread
         self.lock = threading.RLock()
 
-    def reconnect(self):
-        try:
-            self.pa.close()
-        except Exception:
-            pass
+    def _open(self):
         self.pa = pulsectl.Pulse("bonfire")
+        self._ev = pulsectl.Pulse("bonfire-events")
+        self._ev.event_mask_set("sink", "source", "sink_input", "card", "server")
+        self._ev.event_callback_set(lambda ev: (_ for _ in ()).throw(pulsectl.PulseLoopStop))
+
+    def reconnect(self):
+        for c in (self.pa, self._ev):
+            try: c.close()
+            except Exception: pass
+        self._open()
 
     def sinks(self):
         return self.pa.sink_list()
@@ -233,7 +250,7 @@ class Engine:
     def ensure_out_eq(self, dev):
         name = "eqout_" + sanitize(dev)
         chain = self.out_chains.get(dev)
-        if chain is None or not chain.alive() or not node_exists(name):
+        if chain is None or not chain.alive():          # alive() is a cheap proc poll (no `pw-cli ls`)
             if chain:
                 chain.stop()
             chain = EqChain(name, self.state["out_eq"].get(dev))
@@ -241,33 +258,53 @@ class Engine:
             self.out_chains[dev] = chain
         return chain
 
-    def apply_outputs(self, names):
+    def apply_outputs(self, names, full=False):
         with self.lock:
-            self._apply(names)
+            self._apply(names, full=full)
 
-    def _apply(self, names):
-        """bonfire.monitor -> [per-output EQ] -> each device. Caller holds self.lock."""
+    def _unlink_out(self, dev):
+        """Drop a device from the fan-out but KEEP its EQ chain alive, so re-selecting is instant."""
+        chain = self.out_chains.get(dev)
+        if not chain:
+            return
+        for ch in ("FL", "FR"):
+            sh("pw-link", "-d", f"{BONFIRE}:monitor_{ch}", f"{chain.node_name}:playback_{ch}")
+            sh("pw-link", "-d", f"{chain.node_name}.out:output_{ch}", f"{dev}:playback_{ch}")
+
+    def _apply(self, names, full=False):
+        """bonfire.monitor -> [per-output EQ] -> each device. DELTA by default: only touch devices
+        that actually changed, so toggling one output is fast and doesn't glitch the others (the old
+        clear-everything-and-rebuild was the ~6s toggle + the re-poll of every EQ chain). full=True
+        clears and rebuilds the whole fan-out (daemon start / device hotplug). Caller holds self.lock."""
         self.ensure_bonfire()
         have = {s.name for s in self.real_sinks()}
         names = [n for n in names if n in have]
         if not names:
             first = next((s.name for s in self.real_sinks()), None)
             names = [first] if first else []
-        for mport, tgt in self._monitor_links():         # clear old fan-out
-            sh("pw-link", "-d", mport, tgt)
-        for dev in list(self.out_chains):                # drop EQ chains for dropped outputs
-            if dev not in names:
-                self.out_chains.pop(dev).stop()
-        for dev in names:
-            sh("pactl", "suspend-sink", dev, "0")        # wake
+        want = set(names)
+        if full:
+            for mport, tgt in self._monitor_links():      # wipe the fan-out and rebuild from scratch
+                sh("pw-link", "-d", mport, tgt)
+            for dev in list(self.out_chains):             # drop chains for devices that are gone
+                if dev not in have:
+                    self.out_chains.pop(dev).stop()
+            self._active_outs = set()
+        have_now = self._active_outs
+        for dev in have_now - want:                       # removed outputs: unlink (chain kept alive)
+            self._unlink_out(dev)
+        for dev in names:                                 # added outputs (all of them, on full)
+            if dev in have_now and not full:
+                continue
+            sh("pactl", "suspend-sink", dev, "0")         # wake (idle sinks get dropped otherwise)
             chain = self.ensure_out_eq(dev)
-            eq = chain.node_name
             for ch in ("FL", "FR"):
-                sh("pw-link", f"{BONFIRE}:monitor_{ch}", f"{eq}:playback_{ch}")
-                sh("pw-link", f"{eq}.out:output_{ch}", f"{dev}:playback_{ch}")
+                sh("pw-link", f"{BONFIRE}:monitor_{ch}", f"{chain.node_name}:playback_{ch}")
+                sh("pw-link", f"{chain.node_name}.out:output_{ch}", f"{dev}:playback_{ch}")
         if os.environ.get("BONFIRE_NO_DEFAULT") != "1":   # test guard: don't hijack the live default
             sh("pactl", "set-default-sink", BONFIRE)
         sh("pactl", "set-sink-mute", BONFIRE, "0")
+        self._active_outs = want
         self.state["outputs"] = names
         save_state(self.state)
         self._last_devs = frozenset(have)
@@ -316,39 +353,76 @@ class Engine:
     def ensure_app_eq(self, key):
         name = "eqapp_" + sanitize(key)
         chain = self.app_chains.get(key)
-        if chain is None or not chain.alive() or not node_exists(name):
+        if chain is None or not chain.alive():
             if chain:
                 chain.stop()
             chain = EqChain(name, self.state["app_eq"].get(key))
             chain.start()
             self.app_chains[key] = chain
-            for ch in ("FL", "FR"):                       # chain output -> bonfire input
-                sh("pw-link", f"{name}.out:output_{ch}", f"{BONFIRE}:playback_{ch}")
+            self._app_link.pop(key, None)             # new chain has no out links yet -> force a (re)link
         return chain
 
+    def _out_links(self, node):
+        """{port -> set(targets)} for node's output ports, parsed from `pw-link -l`."""
+        out = sh("pw-link", "-l").stdout
+        res, cur = {}, None
+        for line in out.splitlines():
+            if line[:1] not in (" ", "\t"):
+                cur = line.strip()
+            else:
+                s = line.strip()
+                if cur and cur.startswith(node + ":output_") and s.startswith("|->"):
+                    res.setdefault(cur.split(":", 1)[1], set()).add(s[3:].strip())
+        return res
+
+    def _ensure_out_link(self, node, dst_sink):
+        """Make node:output_{FL,FR} feed EXACTLY dst_sink:playback_{FL,FR}. Idempotent -- only changes
+        what's wrong -- so a steady route doesn't re-link (and glitch) on every reconcile."""
+        links = self._out_links(node)
+        for ch in ("FL", "FR"):
+            want = f"{dst_sink}:playback_{ch}"
+            cur = links.get(f"output_{ch}", set())
+            for t in cur:
+                if t != want:
+                    sh("pw-link", "-d", f"{node}:output_{ch}", t)
+            if want not in cur:
+                sh("pw-link", f"{node}:output_{ch}", want)
+
+    def _route_target(self, key, have):
+        """Where an app should land: an override device (if set + present), else the bonfire merge."""
+        dev = self.state["app_route"].get(key, "")
+        return dev if (dev and dev in have) else BONFIRE
+
     def reconcile_apps(self):
-        """Route each EQ'd app through its per-app chain into the bonfire; flat apps go straight in."""
+        """Send each app to its route target -- an override device, else the bonfire merge. Apps with a
+        non-flat EQ pass through their own eqapp chain first (chain.out -> target); flat apps move
+        straight to the target."""
         by_name = {s.name: s for s in self.sinks()}
-        bf = by_name.get(BONFIRE)
-        if not bf:
+        if BONFIRE not in by_name:
             return
+        have = {s.name for s in self.real_sinks()}
+        no_move = os.environ.get("BONFIRE_NO_MOVE") == "1"
         active = set()
         for si in self._app_streams():
             key = clean_app_name(si)
             gains = self.state["app_eq"].get(key)
+            target = self._route_target(key, have)        # bonfire sink name, or an override device
             if gains and not flat(gains):
                 active.add(key)
                 chain = self.ensure_app_eq(key)
+                if self._app_link.get(key) != target:    # only (re)link when the route actually changed
+                    self._ensure_out_link(chain.node_name + ".out", target)   # eqapp.out -> target
+                    self._app_link[key] = target
                 tgt = by_name.get(chain.node_name)
-                if tgt and si.sink != tgt.index and os.environ.get("BONFIRE_NO_MOVE") != "1":
-                    try: self.pa.sink_input_move(si.index, tgt.index)
-                    except Exception: pass
-            elif si.sink != bf.index and os.environ.get("BONFIRE_NO_MOVE") != "1":
-                try: self.pa.sink_input_move(si.index, bf.index)
+            else:
+                tgt = by_name.get(target)
+            if tgt and si.sink != tgt.index and not no_move:
+                try: self.pa.sink_input_move(si.index, tgt.index)
                 except Exception: pass
         for key in list(self.app_chains):                 # tear down chains with no live EQ'd app
             if key not in active:
                 self.app_chains.pop(key).stop()
+                self._app_link.pop(key, None)
 
     def set_app_eq(self, app, band, gain):
         with self.lock:
@@ -384,6 +458,16 @@ class Engine:
             save_state(self.state)
             self.reconcile_apps()
 
+    def set_app_route(self, app, dev):
+        """Pin an app's output: dev="" (or "system") = follow the bonfire merge; else override to dev."""
+        with self.lock:
+            if dev:
+                self.state["app_route"][app] = dev
+            else:
+                self.state["app_route"].pop(app, None)
+            save_state(self.state)
+            self.reconcile_apps()
+
     def status(self):
         try:
             default = self.pa.server_info().default_sink_name
@@ -398,6 +482,7 @@ class Engine:
             "out_eq": self.state["out_eq"],
             "apps": sorted(set(clean_app_name(si) for si in self._app_streams())),
             "app_eq": self.state["app_eq"],
+            "app_route": self.state["app_route"],
         }
 
     def reconcile(self):
@@ -413,7 +498,7 @@ class Engine:
                 if ok and devs == getattr(self, "_last_devs", None):
                     self.reconcile_apps()          # apps come/go without a device change
                     return
-                self._apply(list(self.state.get("outputs") or []))
+                self._apply(list(self.state.get("outputs") or []), full=True)
             except Exception:
                 self.reconnect()
 
@@ -423,60 +508,83 @@ class Engine:
         if not want:
             first = next((s.name for s in self.real_sinks()), None)
             want = [first] if first else []
-        self.apply_outputs(want)
+        self.apply_outputs(want, full=True)
+
+    # -------- the single pulse thread: owns both connections, runs commands + reconciles --------
+    def worker(self):
+        self._open()
+        self.start()
+        self._drain()
+        while True:
+            try:
+                self._ev.event_listen(timeout=0.4)        # short: also the command-queue poll granularity
+            except pulsectl.PulseLoopStop:
+                pass
+            except Exception:
+                try: self.reconnect()
+                except Exception: pass
+                self._drain()
+                continue
+            self._drain()                                 # commands first (likely why we woke)
+            try:
+                self.reconcile()
+            except Exception:
+                try: self.reconnect()
+                except Exception: pass
+
+    def _drain(self):
+        while not self.cmd_q.empty():
+            parts, rq = self.cmd_q.get()
+            rq.put(self._dispatch(parts))
+
+    def submit(self, parts, timeout=15):
+        """Socket thread -> worker thread: enqueue a command, await its reply. Deliberately touches NO
+        pulse object (the worker owns both connections); the worker's short event_listen timeout is the
+        poll that picks this up within a fraction of a second."""
+        rq = queue.Queue()
+        self.cmd_q.put((parts, rq))
+        try:
+            return rq.get(timeout=timeout)
+        except Exception:
+            return "err timeout"
+
+    def _dispatch(self, parts):                           # runs ON the worker thread (all pulse access safe)
+        if not parts:
+            return "err empty"
+        cmd = parts[0]
+        try:
+            if cmd == "status":
+                return json.dumps(self.status())
+            if cmd == "ping":
+                return "pong"
+            if cmd == "outputs":
+                self.apply_outputs(parts[1:])
+                return "ok"
+            if cmd == "route" and len(parts) >= 3:        # route <app> <device>|system (per-app output override)
+                dev = parts[2]
+                self.set_app_route(parts[1], "" if dev in ("system", "") else dev)
+                return "ok"
+            if cmd == "eq" and len(parts) >= 3 and parts[1] in ("out", "app"):
+                scope, target = parts[1], parts[2]
+                if len(parts) >= 4 and parts[3] == "reset":
+                    (self.reset_out_eq if scope == "out" else self.reset_app_eq)(target)
+                    return "ok"
+                if len(parts) >= 4 and parts[3] == "all":  # bulk set (presets): eq <scope> <t> all g0..g9
+                    gains = [float(x) for x in parts[4:4 + NB]]
+                    (self.set_out_eq_all if scope == "out" else self.set_app_eq_all)(target, gains)
+                    return "ok"
+                band, gain = int(parts[3]), float(parts[4])
+                (self.set_out_eq if scope == "out" else self.set_app_eq)(target, band, gain)
+                return "ok"
+            return f"err unknown: {parts}"
+        except Exception as e:
+            return f"err {e}"
 
 
 # ------------------------- daemon + CLI --------------------------
-def handle(engine, line):
-    try:
-        parts = json.loads(line)                 # args arrive JSON-encoded (multi-word app names survive)
-    except Exception:
-        parts = line.strip().split()
-    if not parts:
-        return "err empty"
-    cmd = parts[0]
-    try:
-        if cmd == "status":
-            return json.dumps(engine.status())
-        if cmd == "ping":
-            return "pong"
-        if cmd == "outputs":
-            engine.apply_outputs(parts[1:])
-            return "ok"
-        if cmd == "eq" and len(parts) >= 3 and parts[1] in ("out", "app"):
-            scope, target = parts[1], parts[2]
-            if len(parts) >= 4 and parts[3] == "reset":
-                (engine.reset_out_eq if scope == "out" else engine.reset_app_eq)(target)
-                return "ok"
-            if len(parts) >= 4 and parts[3] == "all":            # bulk set (presets): eq <scope> <t> all g0..g9
-                gains = [float(x) for x in parts[4:4 + NB]]
-                (engine.set_out_eq_all if scope == "out" else engine.set_app_eq_all)(target, gains)
-                return "ok"
-            band, gain = int(parts[3]), float(parts[4])
-            (engine.set_out_eq if scope == "out" else engine.set_app_eq)(target, band, gain)
-            return "ok"
-        return f"err unknown: {parts}"
-    except Exception as e:
-        return f"err {e}"
-
-
-def events_thread(engine):
-    while True:
-        try:
-            p = pulsectl.Pulse("bonfire-events")
-            p.event_mask_set("sink", "source", "sink_input", "card", "server")
-            p.event_callback_set(lambda ev: (_ for _ in ()).throw(pulsectl.PulseLoopStop))
-            while True:
-                p.event_listen(timeout=3)
-                engine.reconcile()
-        except Exception:
-            time.sleep(1.5)
-
-
 def run_daemon():
     engine = Engine()
-    engine.start()
-    threading.Thread(target=events_thread, args=(engine,), daemon=True).start()
+    threading.Thread(target=engine.worker, daemon=True).start()
     try:
         os.unlink(SOCK)
     except OSError:
@@ -488,7 +596,11 @@ def run_daemon():
         conn, _ = srv.accept()
         try:
             data = conn.recv(4096).decode("utf-8", "replace")
-            reply = handle(engine, data)
+            try:
+                parts = json.loads(data)          # args arrive JSON-encoded (multi-word app names survive)
+            except Exception:
+                parts = data.strip().split()
+            reply = engine.submit(parts)          # hand to the pulse thread, await its reply
             conn.sendall((reply + "\n").encode())
         except Exception:
             pass
