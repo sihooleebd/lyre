@@ -1,91 +1,84 @@
-# Timbre
+# bonfire
 
-**Universal audio routing for Linux** — a [SoundSource](https://rogueamoeba.com/soundsource/) /
-FineTune-style control panel for PipeWire, in GTK4 + libadwaita.
+**One native audio engine for Linux** — per-app and per-output EQ **plus** routing and
+multi-device output for PipeWire, with no EasyEffects and no GUI app. It's a headless
+daemon you drive over a tiny CLI (a desktop panel is the intended front-end).
 
-One small window to control all your system audio:
-
-- **Output devices** — a volume slider per device (per-output gain), mute, and which
-  device(s) you're playing on. Tick **one** to switch output, or **several** to play
-  on all of them at once.
-- **Per-app routing** — send any individual app to any specific device (or through
-  EasyEffects), independent of everything else.
-- **Per-app volume & mute**, with real app names and icons.
-
-It's **event-driven** (updates the instant anything changes — no polling), and it talks
-to PipeWire through `pulsectl` (libpulse) and `pw-link`.
-
-## Why
-
-PulseAudio-style `module-combine-sink` is fragile on PipeWire: its internal streams get
-re-pinned by `module-stream-restore`, which can route one back into an effects sink and
-create a feedback loop that kills playback. Timbre instead builds a single **null-sink
-"router"** and fans it out to your devices with plain graph links — links can't be
-scrambled, so simultaneous output to several devices just works and stays working.
+Everything flows through one two-stage graph:
 
 ```
-apps ─▶ Timbre router (a null-sink, the default output)
-            └─▶ pw-link fan-out ─▶ the device(s) you pick
+app A ─▶ [EQ·A] ─┐
+app B ─▶ [EQ·B] ─┼▶ 🔥 bonfire ─▶ monitor ─┬▶ [EQ·speakers] ─▶ speakers
+app C ─▶ [EQ·C] ─┘   (null-sink: merge)     └▶ [EQ·headset]  ─▶ headset
 ```
 
-Picking outputs = choosing which devices the router's monitor is linked to. One device or
-many is the exact same operation.
+- **Per-app EQ** — each app gets its own 10-band EQ, applied before it reaches the mix.
+- **The bonfire** — a single null-sink everything merges into (the system default output),
+  then fanned out to one or several devices at once via plain graph links.
+- **Per-output EQ** — each output device gets its own 10-band EQ on the way out.
+- **Routing + multi-device** — send any app anywhere; play on several devices simultaneously.
 
-## Install / run
+Every EQ box is a native PipeWire `module-filter-chain` (builtin `bq_peaking`/shelf biquad
+bands) that bonfire hosts and tweaks live — **no EasyEffects**. Every arrow is a `pw-link`;
+the merge/fan-out can't be scrambled by `module-stream-restore` the way `module-combine-sink`
+could, so simultaneous output stays working.
+
+## How it works
+
+bonfire is a daemon (a filter-chain only lives as long as the client that loaded it, so the
+daemon *hosts* every chain). It reacts to apps and devices appearing via a libpulse event
+loop, keeps the graph correct, and exposes a unix-socket CLI:
 
 ```sh
-nix run github:sihooleebd/timbre
+bonfire daemon                 # the engine (run from a systemd --user service)
+bonfire outputs speakers hdmi  # fan the bonfire out to these device(s)
+bonfire eq app Firefox 3 -4    # per-app EQ: band 3 to -4 dB
+bonfire eq out speakers 0 6    # per-output EQ: band 0 to +6 dB
+bonfire eq app Firefox reset   # flatten
+bonfire status                 # JSON: devices, apps, bands, current EQ/outputs
 ```
 
-### As a flake input
+Bands are the 10-band ISO set (31 Hz … 16 kHz). State persists in
+`~/.config/bonfire/state.json`.
+
+## Install
 
 ```nix
 {
-  inputs.timbre.url = "github:sihooleebd/timbre";
+  inputs.bonfire.url = "github:sihooleebd/bonfire";
 
-  # in a NixOS / home-manager module:
-  environment.systemPackages = [ inputs.timbre.packages.${pkgs.system}.default ];
+  # NixOS / home-manager: install the package and run the daemon at login
+  environment.systemPackages = [ inputs.bonfire.packages.${pkgs.system}.default ];
+
+  systemd.user.services.bonfire = {
+    Unit = {
+      Description = "bonfire -- PipeWire EQ + routing engine";
+      After = [ "pipewire.service" "pipewire-pulse.service" "wireplumber.service" ];
+      PartOf = [ "graphical-session.target" ];
+    };
+    Install.WantedBy = [ "graphical-session.target" ];
+    Service = {
+      ExecStart = "${inputs.bonfire.packages.${pkgs.system}.default}/bin/bonfire daemon";
+      Restart = "on-failure"; RestartSec = 2;
+    };
+  };
 }
 ```
 
-### Wire it as the system output pipeline (optional)
-
-`timbre --apply` sets up the whole pipeline headlessly from `~/.config/timbre/outputs`
-(creates the router, links it to the saved devices, makes it the default). Run it from a
-systemd **user** service at login so audio is routed before the GUI is ever opened:
-
-```nix
-systemd.user.services.timbre-pipeline = {
-  Unit = {
-    Description = "Timbre system output pipeline";
-    After = [ "pipewire.service" "pipewire-pulse.service" "wireplumber.service" ];
-    PartOf = [ "graphical-session.target" ];
-  };
-  Install.WantedBy = [ "graphical-session.target" ];
-  Service = { Type = "oneshot"; RemainAfterExit = true;
-              ExecStart = "${pkgs.timbre}/bin/timbre --apply"; };
-};
-```
-
-If the service ever fails, WirePlumber still picks a real device as the default, so you're
-never left without sound.
-
-## EasyEffects
-
-If you use [EasyEffects](https://github.com/wwmm/easyeffects) for EQ/effects, it sits in
-front of the router (apps → EasyEffects → router → devices); the per-app menu can send
-individual apps *through EasyEffects* or straight to a device.
+If the daemon ever dies, WirePlumber still picks a real device as the default — you're never
+left without sound.
 
 ## Development
 
 ```sh
 nix develop
-python -m timbre.main
+python -m bonfire.main daemon        # in one shell
+python -m bonfire.main status        # in another
 ```
 
-Everything lives in `timbre/main.py` — the PipeWire wrapper and the GTK UI. `package.nix`
-is the derivation (`buildPythonApplication`, GTK-wrapped, with `pactl` + `pw-link` on its
-`PATH`); `flake.nix` exposes `packages`, `apps`, and a `devShell`.
+It's all in `bonfire/main.py` — the EQ-chain hosting, the two-stage graph, the engine, and
+the CLI. `package.nix` is the derivation (`buildPythonApplication` with `pactl` / `pw-cli` /
+`pw-link` on its `PATH`); `flake.nix` exposes `packages`, `apps`, and a `devShell`.
 
 ## License
 

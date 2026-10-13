@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """bonfire -- a headless, CLI-driven audio engine for PipeWire.
 
-Replaces EasyEffects + Timbre with one native graph:
+Replaces EasyEffects with one native graph:
 
     apps ─▶ [per-app EQ]* ─▶ 🔥 bonfire (null sink) ─▶ [per-output EQ] ─▶ device(s)
 
@@ -10,9 +10,6 @@ daemon (a filter-chain only lives as long as the client that loaded it, so the
 daemon keeps a `pw-cli -m` process alive per chain). The daemon reacts to apps &
 devices appearing via libpulse events and keeps the graph correct. The only UI is
 the CLI -- the notif-centre Sound menu shells commands at it over a unix socket.
-
-Phase 1: bonfire sink + per-output EQ + output fan-out + CLI + events.
-(Per-app EQ chains come in phase 2; the scaffolding is here.)
 """
 import os
 import re

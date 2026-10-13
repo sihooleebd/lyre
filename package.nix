@@ -23,7 +23,7 @@ python3Packages.buildPythonApplication {
   pythonImportsCheck = [ "bonfire" ];
 
   meta = {
-    description = "Headless per-app / per-output EQ + routing engine for PipeWire (replaces EasyEffects + Timbre)";
+    description = "Headless per-app / per-output EQ + routing engine for PipeWire (replaces EasyEffects)";
     homepage = "https://github.com/sihooleebd/bonfire";
     license = lib.licenses.mit;
     mainProgram = "bonfire";
