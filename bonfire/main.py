@@ -283,6 +283,17 @@ class Engine:
                 chain.set_band(band, gain)
             save_state(self.state)
 
+    def set_out_eq_all(self, dev, gains):
+        """Set every output band at once (one apply_all) -- used by presets."""
+        with self.lock:
+            g = (list(gains) + [0.0] * NB)[:NB]
+            self.state["out_eq"][dev] = g
+            chain = self.out_chains.get(dev)
+            if chain:
+                chain.gains = list(g)
+                chain.apply_all()
+            save_state(self.state)
+
     def reset_out_eq(self, dev):
         with self.lock:
             self.state["out_eq"][dev] = [0.0] * NB
@@ -351,6 +362,21 @@ class Engine:
             chain = self.app_chains.get(app)
             if chain and 0 <= band < NB:
                 chain.set_band(band, gain)
+
+    def set_app_eq_all(self, app, gains):
+        """Set every app band at once (one reconcile + one apply_all) -- used by presets."""
+        with self.lock:
+            g = (list(gains) + [0.0] * NB)[:NB]
+            if flat(g):
+                self.state["app_eq"].pop(app, None)
+            else:
+                self.state["app_eq"][app] = g
+            save_state(self.state)
+            self.reconcile_apps()
+            chain = self.app_chains.get(app)
+            if chain:
+                chain.gains = list(g)
+                chain.apply_all()
 
     def reset_app_eq(self, app):
         with self.lock:
@@ -421,6 +447,10 @@ def handle(engine, line):
             scope, target = parts[1], parts[2]
             if len(parts) >= 4 and parts[3] == "reset":
                 (engine.reset_out_eq if scope == "out" else engine.reset_app_eq)(target)
+                return "ok"
+            if len(parts) >= 4 and parts[3] == "all":            # bulk set (presets): eq <scope> <t> all g0..g9
+                gains = [float(x) for x in parts[4:4 + NB]]
+                (engine.set_out_eq_all if scope == "out" else engine.set_app_eq_all)(target, gains)
                 return "ok"
             band, gain = int(parts[3]), float(parts[4])
             (engine.set_out_eq if scope == "out" else engine.set_app_eq)(target, band, gain)
